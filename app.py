@@ -39,6 +39,9 @@ MAX_PCT_FROM_LOWER = 15     # Price within 15% of weekly BB lower
 PRICE_CACHE_FILE = CACHE_DIR / 'price_cache.json'
 DPS_CACHE_FILE = CACHE_DIR / 'dps_cache.json'
 
+# 持仓股：无论是否满足高股息/低估值筛选，始终显示在看板（ts_code）
+HOLDINGS = ['003816.SZ', '600690.SH']  # 中国广核 / 海尔智家
+
 
 def load_token():
     return os.getenv('TUSHARE_TOKEN', '')
@@ -116,7 +119,9 @@ def screen_from_cache():
     df['mcap_b'] = df['total_mv'] / 1e4
     large = df[df['mcap_b'] > MIN_MARKET_CAP].copy()
     large['dv'] = pd.to_numeric(large['dv_ttm'], errors='coerce')
-    high = large[large['dv'] > DIVIDEND_THRESHOLD].copy()
+    # 高股息股 + 持仓股（持仓股无论股息率/估值是否达标都始终显示）
+    keep = (large['dv'] > DIVIDEND_THRESHOLD) | (large['ts_code'].isin(HOLDINGS))
+    high = large[keep].copy()
     if high.empty:
         return pd.DataFrame()
 
@@ -127,6 +132,7 @@ def screen_from_cache():
         results.append({
             'code': r['ts_code'],
             'name': name_map.get(r['ts_code'], r['ts_code']),
+            'is_holding': bool(r['ts_code'] in HOLDINGS),
             'market_cap_billion': round(float(r['mcap_b']), 2),
             'latest_price': round(price, 2),
             'dividend_yield': round(div_y, 2),
@@ -339,6 +345,7 @@ def apply_price_filter(df):
         return df
     mask = df['pct_from_low'].notna() & df['pct_from_lower'].notna()
     mask &= (df['pct_from_low'] < MAX_PCT_FROM_LOW) & (df['pct_from_lower'] < MAX_PCT_FROM_LOWER)
+    mask |= df['code'].isin(HOLDINGS)  # 持仓股始终保留
     return df[mask].copy()
 
 
