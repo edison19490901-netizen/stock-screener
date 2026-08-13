@@ -44,6 +44,59 @@ def load_token():
     return os.getenv('TUSHARE_TOKEN', '')
 
 
+def safe_float(val, default=0.0):
+    """Convert value to float, handling NaN/None."""
+    try:
+        return float(val) if pd.notna(val) else default
+    except (ValueError, TypeError):
+        return default
+
+
+def safe_int(val, default=0):
+    """Convert value to int, handling NaN/None."""
+    try:
+        return int(float(val)) if pd.notna(val) else default
+    except (ValueError, TypeError):
+        return default
+
+
+def calc_grid(low, high, price):
+    """
+    Fibonacci grid between 1Y low and 1Y high.
+    5 lines (0.25 / 0.382 / 0.5 / 0.618 / 0.75) → 6 zones (bottom→top: 1..6).
+    Zones 1-5 each hold 2份 (2 units); zone 6 is a no-op (不操作).
+    Returns line prices + current zone (1-6).
+    """
+    if not low or not high or high <= low:
+        return {'grid_25': None, 'grid_382': None, 'grid_50': None,
+                'grid_618': None, 'grid_75': None, 'grid_zone': None}
+    rng = high - low
+    l25 = low + 0.25 * rng
+    l382 = low + 0.382 * rng
+    l50 = low + 0.5 * rng
+    l618 = low + 0.618 * rng
+    l75 = low + 0.75 * rng
+    zone = 1
+    if price >= l25:
+        zone = 2
+    if price >= l382:
+        zone = 3
+    if price >= l50:
+        zone = 4
+    if price >= l618:
+        zone = 5
+    if price >= l75:
+        zone = 6
+    return {
+        'grid_25': round(l25, 4),
+        'grid_382': round(l382, 4),
+        'grid_50': round(l50, 4),
+        'grid_618': round(l618, 4),
+        'grid_75': round(l75, 4),
+        'grid_zone': zone,
+    }
+
+
 # ════════════════════ Data Layer ════════════════════
 
 def screen_from_cache():
@@ -79,6 +132,9 @@ def screen_from_cache():
             'dividend_yield': round(div_y, 2),
             'dividend_per_share': round(div_y / 100 * price, 4) if div_y > 0 else None,
             'min_price_1y': None,
+            'max_price_1y': None,
+            'grid_25': None, 'grid_382': None, 'grid_50': None,
+            'grid_618': None, 'grid_75': None, 'grid_zone': None,
             'pct_from_low': None,
             'bb_upper': None, 'bb_lower': None,
             'pct_from_upper': None, 'pct_from_lower': None,
@@ -216,6 +272,17 @@ def supplement_baostock(df):
                 df.at[i, 'min_price_1y'] = round(mn, 2)
                 df.at[i, 'pct_from_low'] = round((df.at[i, 'latest_price'] - mn) / mn * 100, 1)
 
+                # 1Y high + Fibonacci grid (6 zones)
+                mx = float(dp['close'].max())
+                df.at[i, 'max_price_1y'] = round(mx, 2)
+                grid = calc_grid(mn, mx, df.at[i, 'latest_price'])
+                df.at[i, 'grid_25'] = grid['grid_25']
+                df.at[i, 'grid_382'] = grid['grid_382']
+                df.at[i, 'grid_50'] = grid['grid_50']
+                df.at[i, 'grid_618'] = grid['grid_618']
+                df.at[i, 'grid_75'] = grid['grid_75']
+                df.at[i, 'grid_zone'] = grid['grid_zone']
+
                 # Dividend yield & market cap from Tushare dv_ttm, not recalculated with price
                 # Bollinger Bands (weekly)
                 try:
@@ -247,9 +314,9 @@ def supplement_baostock(df):
         # Rate limit: 150ms between stocks
         time.sleep(0.15)
 
-        # Save daily price history + daily BB for mini chart (last 60 days)
+        # Save daily price history + daily BB for mini chart (last ~1 year)
         try:
-            closes = [round(float(c), 2) for c in dp['close'].values[-60:].tolist()]
+            closes = [round(float(c), 2) for c in dp['close'].values[-260:].tolist()]
             df.at[i, 'price_history'] = json.dumps(closes)
             if len(closes) >= 20:
                 import numpy as np
@@ -485,6 +552,8 @@ class Handler(SimpleHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == '/api/data':
             self._api_data()
+        elif path == '/api/export':
+            self._export_excel()
         elif path == '/api/health':
             self._json({'status': 'ok', 'cache': CACHE_DIR.exists()})
         elif path in ('/', '/password.html'):
@@ -497,7 +566,7 @@ class Handler(SimpleHTTPRequestHandler):
                 self._serve_dashboard()
             else:
                 self._redirect('/')
-        elif path in ('/manifest.json', '/sw.js', '/stock_screen.png', '/stock.png', '/screen_icon.png'):
+        elif path in ('/manifest.json', '/sw.js', '/ox_icon.png', '/ox_icon-32.png', '/ox_icon-180.png', '/ox_icon-192.png', '/ox_icon-512.png'):
             self._send_static(path)
         else:
             self.send_error(404)
@@ -769,6 +838,65 @@ class Handler(SimpleHTTPRequestHandler):
         else:
             data = []
         self._json({'stocks': data, 'count': len(data)})
+
+    def _export_excel(self):
+        """Generate and serve an Excel (.xlsx) file of screened stocks."""
+        try:
+            from io import BytesIO
+            df, _ = run_full_pipeline(force_refresh=False)
+            if df.empty:
+                self._json({'error': 'No data available'})
+                return
+            rows = []
+            for _, r in df.iterrows():
+                dps = safe_float(r.get('dividend_per_share'), 0)
+                rows.append({
+                    '代码': r.get('code', ''),
+                    '名称': r.get('name', ''),
+                    '最新价': safe_float(r.get('latest_price'), 0),
+                    '股息率(%)': safe_float(r.get('dividend_yield'), 0),
+                    '每股分红DPS': dps if dps > 0 else None,
+                    '目标价6%': round(dps / 0.06, 2) if dps > 0 else None,
+                    '目标价5.5%': round(dps / 0.055, 2) if dps > 0 else None,
+                    '目标价5%': round(dps / 0.05, 2) if dps > 0 else None,
+                    '目标价4.5%': round(dps / 0.045, 2) if dps > 0 else None,
+                    '市值(亿)': safe_float(r.get('market_cap_billion'), 0),
+                    '1Y最低': r.get('min_price_1y'),
+                    '1Y最高': r.get('max_price_1y'),
+                    '网格0.25': r.get('grid_25'),
+                    '网格0.382': r.get('grid_382'),
+                    '网格0.5': r.get('grid_50'),
+                    '网格0.618': r.get('grid_618'),
+                    '网格0.75': r.get('grid_75'),
+                    '网格区域': r.get('grid_zone'),
+                    '距1Y低点(%)': r.get('pct_from_low'),
+                    'BB上轨': r.get('bb_upper'),
+                    'BB下轨': r.get('bb_lower'),
+                    '距BB下轨(%)': r.get('pct_from_lower'),
+                })
+            export_df = pd.DataFrame(rows)
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                export_df.to_excel(writer, sheet_name='Stocks', index=False)
+                ws = writer.sheets['Stocks']
+                for col_idx, col_name in enumerate(export_df.columns, 1):
+                    max_len = max(
+                        export_df[col_name].astype(str).str.len().max(),
+                        len(str(col_name))
+                    )
+                    ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = min(max_len + 4, 40)
+            body = output.getvalue()
+            filename = f'dividend_stocks_{bj_now().strftime("%Y%m%d_%H%M")}.xlsx'
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+            self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._json({'error': f'Export failed: {e}'}, 500)
 
     def _api_update(self):
         ok, msg = update_tushare_cache()

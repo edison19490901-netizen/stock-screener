@@ -1,12 +1,17 @@
+# Secrets
 .env
+
+# Python
 __pycache__/
 *.pyc
-cache/price_cache.json
-cache/*.parquet
-dashboard_*.html
 venv/
+
+# IDE
 .idea/
+
+# Logs
 auto_report.log
-output/
+
+# OS
 .DS_Store
 Thumbs.db

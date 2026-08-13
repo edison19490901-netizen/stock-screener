@@ -1,13 +1,16 @@
 services:
   - type: web
-    name: dashboard-high-dividend
+    name: stock-screener
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
+    healthCheckPath: /api/health
     envVars:
       - key: TUSHARE_TOKEN
         sync: false
       - key: DASHBOARD_PASSWORD
+        sync: false
+      - key: PUSHPLUS_TOKEN
         sync: false
       - key: PORT
         value: "8080"
