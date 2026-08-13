@@ -23,6 +23,7 @@
 - 市值 > 500 亿
 - 最新价距 1 年低点 < 15%
 - 最新价距周线 BB 下轨 < 15%
+- **持仓股（HOLDINGS）**：`app.py` 顶部 `HOLDINGS` 常量里的股票，无论是否满足上述条件都强制纳入并跳过价格过滤（当前：中国广核 003816.SZ、海尔智家 600690.SH）；前端以金色「持仓」标签标识
 
 ## 网格交易策略（6 区斐波那契）
 
@@ -58,6 +59,7 @@ Tushare daily_basic (股息率/市值，慢变化)   Baostock 日线 (价格/K�
 
 | 位置 | 说明 |
 |------|------|
+| `app.py:43` | HOLDINGS 持仓股常量（强制纳入 + 跳过价格过滤） |
 | `app.py:47-60` | safe_float / safe_int NaN 防护 |
 | `app.py:63-91` | calc_grid()（5 线 → 6 区） |
 | `app.py:102-150` | screen_from_cache()（读 parquet 缓存） |
