@@ -32,6 +32,13 @@ try:
 except ImportError:
     pass
 
+# Bypass any system HTTP proxy (Windows "Internet Options" or HTTP(S)_PROXY env).
+# All data sources here (Tushare api.waditu.com, PushPlus, Baostock) are domestic
+# and must NOT be routed through a local proxy — when the proxy app is off, every
+# request fails with WinError 10061 and Tushare silently falls back to stale cache.
+os.environ['NO_PROXY'] = '*'
+os.environ['no_proxy'] = '*'
+
 DIVIDEND_THRESHOLD = 3.0
 MIN_MARKET_CAP = 500
 MAX_PCT_FROM_LOW = 15       # Price within 15% of 1Y low
