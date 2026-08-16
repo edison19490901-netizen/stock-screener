@@ -126,6 +126,8 @@ stock-screener/
 | `/api/update` | POST | 拉取 Tushare 股息/市值数据 |
 | `/api/export` | GET | 下载 Excel |
 | `/api/pushplus` | POST | 推送微信日报 |
+| `/api/analysis` | GET | 行情解读（整体概览 + 重点个股 + markdown 报告） |
+| `/api/pushplus_analysis` | POST | 推送行情解读到微信（markdown） |
 | `/api/health` | GET | 健康检查 |
 | `/login` | POST | 密码登录 |
 

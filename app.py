@@ -440,6 +440,362 @@ def update_tushare_cache():
     return True, f'Updated {len(df)} stocks ({trade_date})'
 
 
+# ════════════════════ 行情解读 Analysis ════════════════════
+
+ZONE_LABELS = {
+    1: '低估·重仓买入', 2: '偏低·加仓', 3: '偏低·加仓',
+    4: '偏高·持有/观望', 5: '偏高·减仓', 6: '不操作',
+}
+
+
+def compute_trend_stats(closes):
+    """Given ~260 daily closes, compute trend indicators (ret_5/ret_20/MA20/MA60/trend).
+    Returns a dict, or None when data is missing/insufficient."""
+    if closes is None:
+        return None
+    if not isinstance(closes, (list, tuple, pd.Series)):
+        return None  # NaN / scalar / unexpected type
+    if len(closes) < 20:
+        return None
+    import numpy as np
+    arr = np.asarray([float(c) for c in closes if c is not None], dtype=float)
+    arr = arr[~np.isnan(arr)]
+    n = len(arr)
+    if n < 20:
+        return None
+    price = float(arr[-1])
+
+    def pct(d):
+        if n <= d or arr[-1 - d] <= 0:
+            return None
+        return round((price / float(arr[-1 - d]) - 1) * 100, 2)
+
+    def ma(w):
+        if n < w:
+            return None
+        return float(arr[-w:].mean())
+
+    ma20, ma60 = ma(20), ma(60)
+    trend = '震荡'
+    if ma20 is not None and ma60 is not None:
+        if price > ma20 > ma60:
+            trend = '上升'
+        elif price < ma20 < ma60:
+            trend = '下降'
+    return {
+        'ret_5': pct(5),
+        'ret_20': pct(20),
+        'ma20': round(ma20, 2) if ma20 is not None else None,
+        'ma60': round(ma60, 2) if ma60 is not None else None,
+        'above_ma20': bool(ma20 is not None and price > ma20),
+        'above_ma60': bool(ma60 is not None and price > ma60),
+        'trend': trend,
+    }
+
+
+def _zone_bounds(row):
+    """Return (lo, hi) price range of current grid zone, or None."""
+    z = row.get('grid_zone')
+    if z is None:
+        return None
+    try:
+        z = int(z)
+    except (TypeError, ValueError):
+        return None
+    m = {
+        1: ('min_price_1y', 'grid_25'),
+        2: ('grid_25', 'grid_382'),
+        3: ('grid_382', 'grid_50'),
+        4: ('grid_50', 'grid_618'),
+        5: ('grid_618', 'grid_75'),
+        6: ('grid_75', 'max_price_1y'),
+    }.get(z)
+    if not m:
+        return None
+    lo = safe_float(row.get(m[0]))
+    hi = safe_float(row.get(m[1]))
+    if not lo or not hi or hi <= lo:
+        return None
+    return lo, hi
+
+
+def _zone_position(row):
+    """Position of current price within its grid zone: 下沿 / 中部 / 上沿, or ''."""
+    b = _zone_bounds(row)
+    if not b:
+        return ''
+    lo, hi = b
+    pos = (safe_float(row.get('latest_price')) - lo) / (hi - lo)
+    if pos <= 0.33:
+        return '下沿'
+    if pos >= 0.66:
+        return '上沿'
+    return '中部'
+
+
+def _zone_int(row):
+    """Safe int conversion of grid_zone (None / NaN → None)."""
+    z = row.get('grid_zone')
+    try:
+        z = float(z)
+        return int(z) if pd.notna(z) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _trend_phrase(t):
+    """Short natural-language trend phrase from compute_trend_stats result."""
+    if not t or not t.get('trend'):
+        return ''
+    r20 = t.get('ret_20')
+    rs = '--' if r20 is None else f"{r20:+.2f}%"
+    if t['trend'] == '上升':
+        return f"趋势偏多（近20日{rs}）"
+    if t['trend'] == '下降':
+        return f"趋势偏弱（近20日{rs}）"
+    return f"趋势震荡（近20日{rs}）"
+
+
+def _fmt_signed(v):
+    return '--' if v is None else f"{v:+.2f}%"
+
+
+def build_analysis(df):
+    """Compute 行情解读: overall overview + highlight stocks + markdown report.
+    Returns a JSON-serializable dict, or None when df is empty."""
+    if df is None or df.empty:
+        return None
+
+    rows = []
+    for _, r in df.iterrows():
+        row = dict(r)
+        closes = None
+        ph = row.get('price_history')
+        if isinstance(ph, str) and ph.strip():
+            try:
+                closes = json.loads(ph)
+            except Exception:
+                closes = None
+        elif isinstance(ph, (list, tuple)) and len(ph):
+            closes = ph
+        row['_trend'] = compute_trend_stats(closes) if closes else None
+        rows.append(row)
+
+    n = len(rows)
+    holdings = [r for r in rows if r.get('is_holding')]
+
+    yields_ = [safe_float(r.get('dividend_yield')) for r in rows if safe_float(r.get('dividend_yield')) > 0]
+    avg_yield = round(sum(yields_) / len(yields_), 2) if yields_ else 0.0
+    ys = sorted(yields_)
+    med_yield = round(ys[len(ys) // 2], 2) if ys else 0.0
+    max_yield = round(max(yields_), 2) if yields_ else 0.0
+    mcaps = [safe_float(r.get('market_cap_billion')) for r in rows if safe_float(r.get('market_cap_billion')) > 0]
+    avg_mcap = round(sum(mcaps) / len(mcaps), 2) if mcaps else 0.0
+
+    zone_dist = {str(z): 0 for z in range(1, 7)}
+    for r in rows:
+        z = r.get('grid_zone')
+        if z is not None:
+            try:
+                z = int(z)
+            except (TypeError, ValueError):
+                z = None
+        if z is not None and 1 <= z <= 6:
+            zone_dist[str(z)] += 1
+    buy_count = sum(zone_dist.get(str(z), 0) for z in (1, 2))
+    zone_buy_pct = round(buy_count / n * 100, 1) if n else 0.0
+
+    lows = [safe_float(r.get('pct_from_low')) for r in rows if r.get('pct_from_low') is not None]
+    avg_pct_from_low = round(sum(lows) / len(lows), 1) if lows else None
+    bbs = [safe_float(r.get('pct_from_lower')) for r in rows if r.get('pct_from_lower') is not None]
+    avg_pct_from_bb = round(sum(bbs) / len(bbs), 1) if bbs else None
+
+    ret5s = [r['_trend']['ret_5'] for r in rows if r['_trend'] and r['_trend'].get('ret_5') is not None]
+    ret20s = [r['_trend']['ret_20'] for r in rows if r['_trend'] and r['_trend'].get('ret_20') is not None]
+    above20 = sum(1 for r in rows if r['_trend'] and r['_trend'].get('above_ma20'))
+    with_trend = sum(1 for r in rows if r['_trend'])
+    avg_ret_5 = round(sum(ret5s) / len(ret5s), 2) if ret5s else None
+    avg_ret_20 = round(sum(ret20s) / len(ret20s), 2) if ret20s else None
+    above_ma20_pct = round(above20 / with_trend * 100, 0) if with_trend else None
+
+    direction = '震荡分化'
+    if avg_ret_20 is not None and above_ma20_pct is not None:
+        if avg_ret_20 > 2 and above_ma20_pct > 60:
+            direction = '整体偏强'
+        elif avg_ret_20 < -2 or above_ma20_pct < 40:
+            direction = '整体偏弱'
+
+    holding_note = f"（含持仓 {len(holdings)} 只）" if holdings else ""
+    summary = f"共筛选 {n} 只高股息低估值股{holding_note}，平均股息率 {avg_yield}%，最高 {max_yield}%。"
+    summary += f"低估区（1-2区）占 {zone_buy_pct}%"
+    if avg_pct_from_low is not None:
+        summary += f"，距1年低点平均 +{avg_pct_from_low}%"
+    summary += f"，整体{direction}"
+    if avg_ret_20 is not None:
+        summary += f"（近20日平均{avg_ret_20:+.2f}%）"
+    if zone_buy_pct >= 30:
+        summary += "。仍有三成以上个股处于低估买入区，可逢低分批布局。"
+    elif zone_buy_pct >= 15:
+        summary += "。部分个股仍处低估区，可择优关注。"
+    else:
+        summary += "。多数个股已脱离低估区，追涨需谨慎。"
+
+    # ── 重点个股挑选 ──
+    def make_h(r, group):
+        t = r.get('_trend') or {}
+        return {
+            'code': r.get('code', ''),
+            'name': r.get('name', ''),
+            'price': round(safe_float(r.get('latest_price')), 2),
+            'yield': round(safe_float(r.get('dividend_yield')), 2),
+            'zone': _zone_int(r),
+            'is_holding': bool(r.get('is_holding')),
+            'group': group,
+            'trend': t.get('trend'),
+            'ret_5': t.get('ret_5'),
+            'ret_20': t.get('ret_20'),
+            'pct_from_low': round(safe_float(r.get('pct_from_low')), 1) if r.get('pct_from_low') is not None else None,
+            'description': '',
+        }
+
+    def zone_pos_val(r):
+        b = _zone_bounds(r)
+        if not b:
+            return 99.0
+        lo, hi = b
+        return (safe_float(r.get('latest_price')) - lo) / (hi - lo)
+
+    buy_sel = [r for r in rows if _zone_int(r) in (1, 2)]
+    buy_sel.sort(key=lambda r: (int(r['grid_zone']), zone_pos_val(r)))
+    buy_sel = buy_sel[:5]
+
+    yield_sel = []
+    for r in sorted(rows, key=lambda r: safe_float(r.get('dividend_yield')), reverse=True):
+        if len(yield_sel) >= 5:
+            break
+        if _zone_int(r) in (1, 2):
+            continue  # 避免与买入区重复
+        yield_sel.append(r)
+
+    holding_sel = holdings
+
+    movers = [r for r in rows if r['_trend'] and r['_trend'].get('ret_5') is not None]
+    movers.sort(key=lambda r: r['_trend']['ret_5'], reverse=True)
+    mover_sel = movers[:3] + (movers[-3:] if len(movers) >= 3 else [])
+
+    pairs = []
+    for r in buy_sel:
+        pairs.append((make_h(r, 'buy'), r))
+    for r in yield_sel:
+        pairs.append((make_h(r, 'yield'), r))
+    for r in holding_sel:
+        pairs.append((make_h(r, 'holding'), r))
+    for r in mover_sel:
+        pairs.append((make_h(r, 'mover'), r))
+
+    highlights = []
+    for h, r in pairs:
+        t = r.get('_trend') or {}
+        z = h['zone']
+        zlbl = ZONE_LABELS.get(z, '')
+        pl = '--' if h['pct_from_low'] is None else f"+{h['pct_from_low']}%"
+        if h['group'] == 'buy':
+            pos = _zone_position(r)
+            h['description'] = (f"处于{z}区（{zlbl}）{('·' + pos) if pos else ''}，股息率{h['yield']}%，"
+                                f"距1年低点{pl}。{_trend_phrase(t)}")
+        elif h['group'] == 'yield':
+            dps = safe_float(r.get('dividend_per_share'))
+            if dps > 0:
+                p6 = dps / 0.06
+                if h['price'] <= p6:
+                    h['description'] = (f"现价买入股息率{h['yield']}%，已高于6%目标价带（P@6%={p6:.2f}），估值有吸引力。"
+                                        f"{_trend_phrase(t)}")
+                else:
+                    drop = (h['price'] / p6 - 1) * 100
+                    h['description'] = (f"股息率{h['yield']}%，距6%目标价（{p6:.2f}）还需下跌约{drop:.1f}%。"
+                                        f"{_trend_phrase(t)}")
+            else:
+                h['description'] = f"股息率{h['yield']}%。"
+        elif h['group'] == 'holding':
+            h['description'] = f"持仓股：处于{z}区（{zlbl}），股息率{h['yield']}%，距1年低点{pl}。{_trend_phrase(t)}"
+        else:  # mover
+            h['description'] = f"近5日{_fmt_signed(h['ret_5'])}，{_trend_phrase(t)}"
+        highlights.append(h)
+
+    analysis = {
+        'generated_at': bj_now().strftime('%Y-%m-%d %H:%M'),
+        'overview': {
+            'total': n,
+            'holdings': len(holdings),
+            'avg_yield': avg_yield,
+            'median_yield': med_yield,
+            'max_yield': max_yield,
+            'avg_mcap': avg_mcap,
+            'zone_dist': zone_dist,
+            'zone_buy_pct': zone_buy_pct,
+            'avg_pct_from_low': avg_pct_from_low,
+            'avg_pct_from_bb': avg_pct_from_bb,
+            'avg_ret_5': avg_ret_5,
+            'avg_ret_20': avg_ret_20,
+            'above_ma20_pct': above_ma20_pct,
+            'direction': direction,
+            'summary': summary,
+        },
+        'highlights': highlights,
+    }
+    analysis['report'] = build_report_markdown(analysis)
+    return analysis
+
+
+def build_report_markdown(a):
+    """Assemble the PushPlus / dashboard Markdown report from an analysis dict."""
+    o = a['overview']
+    L = []
+    date_str = a.get('generated_at', '')[:10]
+    L.append(f"# 高股息行情解读 {date_str}")
+    L.append('')
+    L.append('## 一、整体概览')
+    L.append(f"- 筛选股数：**{o['total']}**（持仓 {o['holdings']}）")
+    L.append(f"- 平均股息率：**{o['avg_yield']}%**（中位 {o['median_yield']}%，最高 {o['max_yield']}%）")
+    L.append(f"- 平均市值：{o['avg_mcap']:.0f} 亿元")
+    dist = ' / '.join(f"{k}区 {v}只" for k, v in sorted(o['zone_dist'].items()))
+    L.append(f"- 网格区间：{dist}；**低估区（1-2区）占比 {o['zone_buy_pct']}%**")
+    if o.get('avg_pct_from_low') is not None:
+        L.append(f"- 距1年低点平均 **+{o['avg_pct_from_low']}%**；距周线布林下轨平均 +{o['avg_pct_from_bb']}%")
+    if o.get('avg_ret_5') is not None:
+        L.append(f"- 近5日平均 {o['avg_ret_5']:+.2f}%，近20日平均 {o['avg_ret_20']:+.2f}%；"
+                 f"站上20日均线 {o['above_ma20_pct']:.0f}%")
+    L.append('')
+    L.append(f"**整体判断**：{o['summary']}")
+    L.append('')
+
+    group_titles = {
+        'buy': '接近买入点（低估/偏低，可关注加仓）',
+        'yield': '股息率吸引力（目标价带）',
+        'holding': '持仓股状态',
+        'mover': '近期异动（近5日）',
+    }
+    numerals = ['二', '三', '四', '五', '六']
+    idx = 0
+    for g in ('buy', 'yield', 'holding', 'mover'):
+        items = [h for h in a['highlights'] if h['group'] == g]
+        if not items:
+            continue
+        L.append(f"## {numerals[idx]}、{group_titles[g]}（{len(items)}只）")
+        if g == 'mover':
+            items = sorted(items, key=lambda h: h['ret_5'] if h['ret_5'] is not None else -999, reverse=True)
+        for i, h in enumerate(items, 1):
+            zs = f"{h['zone']}区" if h['zone'] else '--'
+            L.append(f"{i}. **{h['name']}**（{h['code']}）｜现价 {h['price']}｜股息率 {h['yield']}%｜{zs}")
+            L.append(f"   {h['description']}")
+        L.append('')
+        idx += 1
+
+    L.append('---')
+    L.append('数据来源：Tushare + Baostock ｜ 仅供参考，不构成投资建议。')
+    return '\n'.join(L)
+
+
 # ════════════════════ PushPlus ════════════════════
 
 import html as html_mod
@@ -566,6 +922,8 @@ class Handler(SimpleHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == '/api/data':
             self._api_data()
+        elif path == '/api/analysis':
+            self._api_analysis()
         elif path == '/api/export':
             self._export_excel()
         elif path == '/api/health':
@@ -616,6 +974,8 @@ class Handler(SimpleHTTPRequestHandler):
             self._api_refresh_prices()
         elif path == '/api/pushplus':
             self._api_pushplus()
+        elif path == '/api/pushplus_analysis':
+            self._api_pushplus_analysis()
         else:
             self.send_error(404)
 
@@ -852,6 +1212,52 @@ class Handler(SimpleHTTPRequestHandler):
         else:
             data = []
         self._json({'stocks': data, 'count': len(data)})
+
+    def _load_analysis_df(self):
+        """Load screened DataFrame for analysis: price cache, else Tushare base cache."""
+        df, _ = load_price_cache()
+        if df.empty:
+            df = screen_from_cache()
+        return df if df is not None else pd.DataFrame()
+
+    def _api_analysis(self):
+        """GET /api/analysis — 行情解读（整体概览 + 重点个股 + markdown 报告）"""
+        try:
+            df = self._load_analysis_df()
+            if df.empty:
+                self._json({'ok': False, 'error': 'No data available for analysis'}, 400)
+                return
+            analysis = build_analysis(df)
+            if not analysis:
+                self._json({'ok': False, 'error': 'Analysis produced no result'}, 500)
+                return
+            self._json({'ok': True, 'analysis': analysis})
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._json({'ok': False, 'error': f'Analysis error: {e}'}, 500)
+
+    def _api_pushplus_analysis(self):
+        """POST /api/pushplus_analysis — 推送行情解读到微信（markdown）"""
+        token = os.getenv('PUSHPLUS_TOKEN', '')
+        if not token:
+            self._json({'ok': False, 'error': 'PUSHPLUS_TOKEN not configured'}, 400)
+            return
+        try:
+            df = self._load_analysis_df()
+            if df.empty:
+                self._json({'ok': False, 'error': 'No data available to push'}, 400)
+                return
+            analysis = build_analysis(df)
+            report = analysis['report']
+            title = f"高股息行情解读 {analysis['generated_at'][:10]}"
+            ok = send_pushplus(token, title, report, 'markdown')
+            print(f'[{bj_now():%H:%M}] PushPlus analysis: {"OK" if ok else "FAIL"} (size={len(report)} chars)')
+            self._json({'ok': ok, 'message': '解读已推送微信' if ok else 'PushPlus 发送失败'})
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self._json({'ok': False, 'error': f'PushPlus analysis error: {e}'}, 500)
 
     def _export_excel(self):
         """Generate and serve an Excel (.xlsx) file of screened stocks."""

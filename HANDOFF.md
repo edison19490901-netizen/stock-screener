@@ -65,6 +65,8 @@ Tushare daily_basic (股息率/市值，慢变化)   Baostock 日线 (价格/K�
 | `app.py:102-150` | screen_from_cache()（读 parquet 缓存） |
 | `app.py:210-333` | supplement_baostock()（价格 + BB + 网格 + 260 日历史） |
 | `app.py:367-388` | run_full_pipeline() |
+| `app.py` 分析区 | compute_trend_stats / build_analysis / build_report_markdown（行情解读，`/api/analysis` + `/api/pushplus_analysis`） |
+| `dashboard.html` | AN 对象（行情解读面板，自动加载 + 推送微信） |
 | `app.py:391-425` | update_tushare_cache()（拉 Tushare） |
 | `app.py:550-606` | Handler.do_GET / do_POST 路由 |
 | `app.py:842-899` | _export_excel()（Excel 导出） |
